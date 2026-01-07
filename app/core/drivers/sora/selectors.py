@@ -41,7 +41,8 @@ class SoraSelectors:
         "input[placeholder*='code']", 
         "input[autocomplete='one-time-code']",
         "text='Enter code'",
-        "text='Verify your identity'"
+        "text='Verify your identity'",
+        "text='Verify your phone number to continue.'"
     ]
 
     # Popups & Dialogs

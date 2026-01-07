@@ -63,12 +63,17 @@ class SoraDriver(BaseDriver):
         # Check credits BEFORE
         logger.info("Checking credits before submission...")
         credits_before = await self.check_credits()
-        
-        if credits_before == 0:
-            logger.warning("Credits are 0. Aborting submission.")
-            raise QuotaExhaustedException("Account has 0 credits remaining.")
-        
-        logger.info(f"Credits BEFORE: {credits_before}")
+
+        # Handle credits check failure
+        if credits_before == -1:
+            logger.warning("⚠️ Could not read credits before submission. Proceeding in FALLBACK mode (no credit verification).")
+            logger.warning("⚠️ This submission may fail if account has no credits.")
+        elif credits_before <= 1:
+            # Credits readable and too low
+            logger.warning(f"Credits are {credits_before} (threshold > 1). Aborting submission.")
+            raise QuotaExhaustedException(f"Account has {credits_before} credits remaining (need > 1).")
+        else:
+            logger.info(f"Credits BEFORE: {credits_before} ✅")
         
         # Fill prompt and submit
         await self.creation_page.fill_prompt(prompt)
@@ -86,42 +91,62 @@ class SoraDriver(BaseDriver):
         # Strict polling loop: Check credits for up to 60 seconds (variable intervals)
         # Sora can be slow to update credits sometimes
         retry_intervals = [2] * 30  # 30 attempts * 2 seconds = 60 seconds max
-        
-        for attempt, wait_time in enumerate(retry_intervals):
-            await asyncio.sleep(wait_time)
-            
-            # Handle potential post-click popups that might appear late
-            if attempt % 5 == 0: # Check every 10 seconds
-                 try:
-                     await self.creation_page.handle_blocking_popups()
-                 except Exception as e:
-                     logger.warning(f"Benign error handling popups during verification: {e}")
-            
-            credits_after = await self.check_credits()
-            
-            if credits_before != -1 and credits_after != -1:
+
+        # FALLBACK MODE: If credits_before was -1, we can't verify via credits
+        if credits_before == -1:
+            logger.warning("⚠️ FALLBACK MODE: Skipping credit verification (credits unreadable)")
+            logger.warning("⚠️ Assuming submission succeeded based on UI state. Risk: may not have actually submitted.")
+            # Wait a bit for UI to update
+            await asyncio.sleep(10)
+            # Check for visual indicators
+            if ui_success:
+                logger.info("✅ UI indicated success. Assuming submitted (UNVERIFIED).")
+                submitted = True
+                credits_after = -1  # Mark as unverified
+            else:
+                logger.error("❌ UI did not confirm success. Submission likely failed.")
+                submitted = False
+                credits_after = -1
+        else:
+            # NORMAL MODE: Verify via credit deduction
+            for attempt, wait_time in enumerate(retry_intervals):
+                await asyncio.sleep(wait_time)
+
+                # Handle potential post-click popups that might appear late
+                if attempt % 5 == 0: # Check every 10 seconds
+                     try:
+                         await self.creation_page.handle_blocking_popups()
+                     except Exception as e:
+                         logger.warning(f"Benign error handling popups during verification: {e}")
+
+                credits_after = await self.check_credits()
+
+                # Edge case: credits_after still -1 after multiple attempts
+                if credits_after == -1:
+                    if attempt < 5:
+                        # Retry a few times
+                        logger.warning(f"⚠️ Credits unreadable during verification (attempt {attempt+1}). Retrying...")
+                        continue
+                    else:
+                        # Give up on credit verification
+                        logger.error("❌ Credits became unreadable during verification. Cannot verify submission.")
+                        raise Exception("Credit verification failed: UI not responding")
+
                 credit_used = credits_before - credits_after
-                
+
                 if credit_used >= 1:
                     logger.info(f"✅ Credit reduction verified! Credits: {credits_before} → {credits_after} (Attempt {attempt+1})")
                     submitted = True
                     break
-                
+
                 elif credit_used < 0:
                      # Rare case: credits increased? (Refund or top-up)
                      logger.warning(f"⚠️ Credits INCREASED? {credits_before} → {credits_after}. Continuing verification...")
-                     
+
                 else: # credit_used == 0
                      # Log progress every few attempts
                      if attempt % 5 == 0:
                          logger.info(f"⏳ Waiting for credit drop... ({credits_before} remaining) - Attempt {attempt+1}/{len(retry_intervals)}")
-
-                     # Secondary Check REMOVED for Strict Verification
-                     # We rely ONLY on credit deduction.
-                     pass
-                     
-            else:
-                 logger.warning("⚠️ Could not read credits during verification.")
 
         if not submitted:
              logger.error(f"❌ Verification FAILED. Credits did not decrease after 60s. Before: {credits_before}, After: {credits_after}")
@@ -191,10 +216,11 @@ class SoraDriver(BaseDriver):
         logger.info("Checking credits before generation...")
         credits_before = await self.check_credits()
         
-        # Raise QuotaExhaustedException if credits are 0
-        if credits_before == 0:
-            logger.warning("Credits are 0. Aborting generation.")
-            raise QuotaExhaustedException("Account has 0 credits remaining.")
+        # Raise QuotaExhaustedException if credits <= 1 (User requirement: > 1)
+        if credits_before != -1 and credits_before <= 1:
+            logger.warning(f"Credits are {credits_before} (require > 1). Aborting generation.")
+            from .pages.creation import QuotaExhaustedException
+            raise QuotaExhaustedException(f"Account has {credits_before} credits remaining (need > 1).")
         
         logger.info(f"Credits BEFORE: {credits_before}. Proceeding with generation.")
              
@@ -256,27 +282,3 @@ class SoraDriver(BaseDriver):
         filename = os.path.basename(local_path)
         return f"/downloads/{filename}"
 
-    async def _download_video(self, url: str) -> str:
-        """
-        Legacy direct download method - DEPRECATED
-        Kept for backward compatibility but should not be used
-        as it's the root cause of incorrect downloads
-        """
-        import os
-        import time
-        logger.warning("⚠️ Using deprecated _download_video method - this may download incorrect video!")
-        timestamp = int(time.time())
-        filename = f"video_{timestamp}.mp4"
-        download_dir = os.path.abspath("data/downloads")
-        os.makedirs(download_dir, exist_ok=True)
-        local_path = os.path.join(download_dir, filename)
-        
-        response = await self.page.request.get(url)
-        if response.status == 200:
-            body = await response.body()
-            with open(local_path, "wb") as f:
-                f.write(body)
-            logger.info(f"✅ Video downloaded: {local_path}")
-            return f"/downloads/{filename}"
-        else:
-            raise Exception(f"Download failed: {response.status}")

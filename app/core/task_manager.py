@@ -8,8 +8,19 @@ from typing import Dict, Optional
 import json
 import logging
 from datetime import datetime
+from sqlalchemy import func as sqla_func
 
 logger = logging.getLogger(__name__)
+
+# Valid job status transitions
+VALID_JOB_TRANSITIONS = {
+    "draft": ["pending", "cancelled"],
+    "pending": ["processing", "cancelled"],
+    "processing": ["completed", "failed", "cancelled"],
+    "completed": [],  # Terminal state
+    "failed": ["pending"],  # Can retry (but only via explicit retry)
+    "cancelled": []  # Terminal state
+}
 
 @dataclass
 class TaskContext:
@@ -27,6 +38,9 @@ class SimpleTaskManager:
     Each task is processed by dedicated worker loops
     """
 
+    # Queue size limits to prevent memory leaks
+    MAX_QUEUE_SIZE = 1000  # Max tasks in each queue
+
     def __init__(self):
         # Lazy initialization - queues created when first accessed
         self._generate_queue = None
@@ -38,12 +52,12 @@ class SimpleTaskManager:
     def _ensure_initialized(self):
         """Initialize queues in the current event loop"""
         if not self._initialized:
-            self._generate_queue = asyncio.Queue()
-            self._poll_queue = asyncio.Queue()  # NEW
-            self._download_queue = asyncio.Queue()
-            self._verify_queue = asyncio.Queue()
+            self._generate_queue = asyncio.Queue(maxsize=self.MAX_QUEUE_SIZE)
+            self._poll_queue = asyncio.Queue(maxsize=self.MAX_QUEUE_SIZE)  # NEW
+            self._download_queue = asyncio.Queue(maxsize=self.MAX_QUEUE_SIZE)
+            self._verify_queue = asyncio.Queue(maxsize=self.MAX_QUEUE_SIZE)
             self._initialized = True
-            logger.info("✅ SimpleTaskManager queues initialized (with poll_queue)")
+            logger.info(f"✅ SimpleTaskManager queues initialized (max_size={self.MAX_QUEUE_SIZE})")
 
 
     @property
@@ -67,26 +81,49 @@ class SimpleTaskManager:
         self._ensure_initialized()
         return self._verify_queue
 
-    
+    async def _put_task_safe(self, queue, task: TaskContext, timeout: float = 5.0):
+        """
+        Safely put task into queue with timeout to prevent blocking
+
+        Args:
+            queue: Target queue
+            task: Task to enqueue
+            timeout: Max seconds to wait if queue is full
+
+        Raises:
+            asyncio.TimeoutError: If queue is full after timeout
+        """
+        # Log warning if queue is getting full (>80%)
+        if queue.qsize() > self.MAX_QUEUE_SIZE * 0.8:
+            logger.warning(
+                f"⚠️ Queue nearly full: {queue.qsize()}/{self.MAX_QUEUE_SIZE} tasks. "
+                f"Attempting to enqueue {task.task_type} for job #{task.job_id}"
+            )
+
+        try:
+            await asyncio.wait_for(queue.put(task), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise Exception(
+                f"Queue full (max_size={self.MAX_QUEUE_SIZE}). "
+                f"Task {task.task_type} for job #{task.job_id} could not be enqueued after {timeout}s."
+            )
+
     async def start_job(self, job):
         """
         Bắt đầu job - initialize task state và add generate task vào queue
-        
+
         Args:
             job: Job model instance
         """
-        # Initialize task state in job
-        task_state = {
-            "tasks": {
-                "generate": {"status": "pending"},
-                "download": {"status": "blocked"},
-                "verify": {"status": "blocked"}
-            },
-            "current_task": "generate"
-        }
-        
+        # Validate status transition
+        self._validate_job_status_transition(job, "processing")
+
+        # Initialize task state in job using default state
+        task_state = self._default_state()
+
         job.task_state = json.dumps(task_state)
         job.status = "processing"
+        job.updated_at = datetime.utcnow()  # Explicit timestamp update
         
         # Add to generate queue
         task = TaskContext(
@@ -105,14 +142,14 @@ class SimpleTaskManager:
     async def complete_submit(self, job, account_id: int, credits_before: int, credits_after: int):
         """
         Submit phase complete → move to poll queue
-        
+
         Args:
             job: Job model instance
             account_id: Account used for generation
             credits_before: Credits before submission
             credits_after: Credits after submission
         """
-        state = json.loads(job.task_state) if job.task_state else self._default_state()
+        state = await self.get_job_state(job)
         
         # Update state to reflect submission
         state["tasks"]["generate"] = {
@@ -127,62 +164,67 @@ class SimpleTaskManager:
         state["current_task"] = "poll"
         
         job.task_state = json.dumps(state)
-        
+        job.updated_at = datetime.utcnow()  # Explicit timestamp update
+
         # Add to poll queue
         task = TaskContext(
             job_id=job.id,
             task_type="poll",
             input_data={
                 "account_id": account_id,
-                "submitted_at": datetime.now().isoformat()
+                "submitted_at": datetime.now().isoformat(),
+                "poll_count": 0  # Initialize poll counter
             }
         )
-        
+
         await self.poll_queue.put(task)
         logger.info(f"✅ Job #{job.id} submitted, moved to poll queue")
     
     async def complete_poll(self, job, video_url: str):
         """
         Poll phase complete (video ready) → move to download queue
-        
+
         Args:
             job: Job model instance
             video_url: Public video URL
         """
-        state = json.loads(job.task_state) if job.task_state else self._default_state()
-        
-        state["tasks"]["generate"]["status"] = "completed"
-        state["tasks"]["generate"]["completed_at"] = datetime.now().isoformat()
-        state["tasks"]["poll"] = {"status": "completed"}
+        state = await self.get_job_state(job)
+
+        # Mark poll as completed
+        state["tasks"]["poll"]["status"] = "completed"
+        state["tasks"]["poll"]["completed_at"] = datetime.now().isoformat()
+
+        # Unlock download task
         state["tasks"]["download"] = {
             "status": "pending",
             "input": {"video_url": video_url}
         }
         state["current_task"] = "download"
-        
+
         job.task_state = json.dumps(state)
         job.video_url = video_url
-        
+        job.updated_at = datetime.utcnow()  # Explicit timestamp update
+
         # Add to download queue
         task = TaskContext(
             job_id=job.id,
             task_type="download",
             input_data={"video_url": video_url}
         )
-        
+
         await self.download_queue.put(task)
         logger.info(f"✅ Job #{job.id} video ready, moved to download queue")
     
     async def complete_generate(self, job, video_url: str, metadata: dict):
         """
         Generate complete → unlock download task
-        
+
         Args:
             job: Job model instance
             video_url: Captured video URL from generation
             metadata: Additional metadata (size, etc.)
         """
-        state = json.loads(job.task_state) if job.task_state else self._default_state()
+        state = await self.get_job_state(job)
         
         # Update generate task
         state["tasks"]["generate"] = {
@@ -200,7 +242,8 @@ class SimpleTaskManager:
         
         job.task_state = json.dumps(state)
         job.video_url = video_url  # Save URL for reference
-        
+        job.updated_at = datetime.utcnow()  # Explicit timestamp update
+
         # Add to download queue
         task = TaskContext(
             job_id=job.id,
@@ -214,38 +257,43 @@ class SimpleTaskManager:
     async def complete_download(self, job, local_path: str, file_size: int):
         """
         Download complete → complete job (skip verify for now)
-        
+
         Args:
             job: Job model instance
             local_path: Path to downloaded video
             file_size: Size of downloaded file
         """
-        state = json.loads(job.task_state) if job.task_state else self._default_state()
+        state = await self.get_job_state(job)
         
         state["tasks"]["download"] = {
             "status": "completed",
             "completed_at": datetime.now().isoformat(),
             "output": {"local_path": local_path, "file_size": file_size}
         }
-        
+
         # For now, skip verify - just complete job
         state["current_task"] = "completed"
+
+        # Validate status transition before changing
+        self._validate_job_status_transition(job, "completed")
+
         job.status = "completed"
         job.local_path = local_path
         job.task_state = json.dumps(state)
-        
+        job.updated_at = datetime.utcnow()  # Explicit timestamp update
+
         logger.info(f"✅ Job #{job.id} completed! Video at {local_path} ({file_size:,} bytes)")
     
     async def fail_task(self, job, task_type: str, error: str):
         """
         Handle task failure với retry logic
-        
+
         Args:
             job: Job model instance
             task_type: Type of task that failed
             error: Error message
         """
-        state = json.loads(job.task_state) if job.task_state else self._default_state()
+        state = await self.get_job_state(job)
         task_state = state["tasks"].get(task_type, {})
         
         retry_count = task_state.get("retry_count", 0) + 1
@@ -257,8 +305,9 @@ class SimpleTaskManager:
             task_state["status"] = "pending"
             task_state["last_error"] = error
             state["tasks"][task_type] = task_state
-            
+
             job.task_state = json.dumps(state)
+            job.updated_at = datetime.utcnow()  # Explicit timestamp update
             
             # Re-add to appropriate queue
             queue = getattr(self, f"{task_type}_queue")
@@ -289,11 +338,15 @@ class SimpleTaskManager:
             task_state["status"] = "failed"
             task_state["error"] = error
             state["tasks"][task_type] = task_state
-            
+
+            # Validate status transition before changing
+            self._validate_job_status_transition(job, "failed")
+
             job.status = "failed"
             job.error_message = f"{task_type} failed after {max_retries} retries: {error}"
             job.task_state = json.dumps(state)
-            
+            job.updated_at = datetime.utcnow()  # Explicit timestamp update
+
             logger.error(f"❌ Job #{job.id} failed permanently: {task_type} - {error}")
     
     def _default_state(self):
@@ -301,6 +354,7 @@ class SimpleTaskManager:
         return {
             "tasks": {
                 "generate": {"status": "pending"},
+                "poll": {"status": "blocked"},
                 "download": {"status": "blocked"},
                 "verify": {"status": "blocked"}
             },
@@ -310,8 +364,73 @@ class SimpleTaskManager:
     async def get_job_state(self, job) -> dict:
         """Get parsed task state from job"""
         if job.task_state:
-            return json.loads(job.task_state)
+            try:
+                state = json.loads(job.task_state)
+                # Validate and fix state if needed
+                return self._validate_and_fix_state(state)
+            except json.JSONDecodeError:
+                logger.error(f"Invalid JSON in job #{job.id} task_state, using default")
+                return self._default_state()
         return self._default_state()
+
+    def _validate_and_fix_state(self, state: dict) -> dict:
+        """
+        Validate task state structure and fix missing fields
+
+        Args:
+            state: Task state dict
+
+        Returns:
+            Fixed/valid task state
+        """
+        default = self._default_state()
+
+        # Ensure top-level keys exist
+        if "tasks" not in state:
+            state["tasks"] = {}
+        if "current_task" not in state:
+            state["current_task"] = "generate"
+
+        # Ensure all task types exist (add missing ones as blocked)
+        for task_type in default["tasks"].keys():
+            if task_type not in state["tasks"]:
+                state["tasks"][task_type] = {"status": "blocked"}
+                logger.warning(f"Added missing task type '{task_type}' to state")
+
+        return state
+
+    def _validate_job_status_transition(self, job, new_status: str, allow_retry: bool = False) -> bool:
+        """
+        Validate if job status transition is allowed
+
+        Args:
+            job: Job model instance
+            new_status: New status to transition to
+            allow_retry: If True, allow failed → pending transition
+
+        Returns:
+            bool: True if transition is valid
+
+        Raises:
+            ValueError: If transition is invalid
+        """
+        current_status = job.status
+        valid_transitions = VALID_JOB_TRANSITIONS.get(current_status, [])
+
+        # Special case: allow failed → pending only if explicitly allowed (retry)
+        if current_status == "failed" and new_status == "pending" and not allow_retry:
+            raise ValueError(
+                f"Invalid transition: {current_status} → {new_status}. "
+                f"Use retry endpoint to restart failed jobs."
+            )
+
+        if new_status not in valid_transitions:
+            raise ValueError(
+                f"Invalid job status transition: {current_status} → {new_status}. "
+                f"Valid transitions from {current_status}: {valid_transitions}"
+            )
+
+        return True
 
     async def retry_subtasks(self, job):
         """
@@ -354,6 +473,7 @@ class SimpleTaskManager:
                 task_type="poll",
                 input_data={
                     "account_id": acct_id,
+                    "poll_count": 0,  # Reset poll counter on retry
                     "retry_count": 0
                 }
             )

@@ -134,7 +134,10 @@ class SoraCreationPage(BasePage):
             raise Exception("Could not find prompt input field")
 
     async def check_quota_exhausted(self) -> bool:
-        """Check if account has run out of video generations"""
+        """Check if account has run out of video generations OR requires verification"""
+        from ..exceptions import VerificationRequiredException
+
+        # 1. Check Quota
         for indicator in SoraSelectors.QUOTA_EXHAUSTED_INDICATORS:
             try:
                 if await self.page.is_visible(indicator, timeout=1000):
@@ -142,6 +145,21 @@ class SoraCreationPage(BasePage):
                     return True
             except:
                 continue
+
+        # 2. Check Verification/Checkpoint (NEW)
+        # Sometimes verification pops up during usage, not just login
+        for indicator in SoraSelectors.VERIFICATION_INDICATORS:
+             try:
+                 if await self.page.is_visible(indicator, timeout=1000):
+                     logger.warning(f"Verification indicator found during creation: {indicator}")
+                     # Snapshot for debugging
+                     await self._snapshot("verification_mid_creation")
+                     raise VerificationRequiredException(f"Verification required: {indicator}")
+             except VerificationRequiredException:
+                 raise
+             except:
+                 continue
+                 
         return False
 
     async def handle_blocking_overlay(self):
@@ -294,160 +312,100 @@ class SoraCreationPage(BasePage):
 
             # === FALLBACK METHOD: CLICKING ===
             logger.info("Falling back to Click method...")
-            max_retries = 3
-            for attempt in range(max_retries):
+
+            # Single click attempt - no aggressive retry to prevent double generation
+            try:
+                # SAFETY: Check if generation already started (from delayed Enter)
+                if await self.check_is_generating():
+                     logger.info("✅ Generation already in progress (detected indicator).")
+                     return True
+
+                # Check for overlay FIRST
+                await self.handle_blocking_overlay()
+
+                # Find button
+                found_retry = await self.find_first_visible(SoraSelectors.GENERATE_BTN)
+                if not found_retry:
+                    logger.warning("Generate button not found for click fallback.")
+                    raise Exception("Generate button not found")
+                _, btn_current = found_retry
+
+                # Check if button is disabled (might mean already generating)
                 try:
-                    if attempt > 0:
-                        logger.info(f"Retry click attempt {attempt + 1}/{max_retries}...")
-                        
-                    # SAFETY: Check if generation started (e.g. from previous attempt or delayed Enter)
-                    if await self.check_is_generating():
-                         logger.info("✅ Generation already in progress (detected indicator). Stopping retries.")
-                         return True
-                    
-                    # Check for overlay FIRST (before finding button, as closing overlay might refresh DOM)
-                    await self.handle_blocking_overlay()
-
-                    # RE-FIND BUTTON to avoid "Element is not attached to the DOM"
-                    # The button often re-renders after blocking overlays or state changes
-                    found_retry = await self.find_first_visible(SoraSelectors.GENERATE_BTN)
-                    if not found_retry:
-                        logger.warning("Generate button not found during retry loop.")
-                        continue
-                    _, btn_current = found_retry
-                    
-                    # Check Enabled State & Prompt Integrity
-                    try:
-                        is_disabled = await btn_current.is_disabled()
-                    except Exception as e:
-                        logger.warning(f"Could not check disabled state (detached?): {e}. Assuming enabled and trying click...")
-                        is_disabled = False
-
+                    is_disabled = await btn_current.is_disabled()
                     if is_disabled:
-                        # CRITICAL FIX: "Disabled" often means "Generating" (Success), not "Empty Prompt" (Failure).
-                        # We must differentiate.
-                        
-                        # 1. Check visual indicators of generation
+                        # Check if already generating
                         if await self.check_is_generating():
-                             logger.info("✅ Generation confirmed (while checking disabled button).")
+                             logger.info("✅ Generation confirmed (button disabled, indicators visible).")
                              return True
-                             
-                        # 2. Check button text for "Generating..."
+                        # Otherwise button might be disabled for other reasons, wait briefly
                         try:
-                            txt = await btn_current.text_content()
-                            if txt and ("generating" in txt.lower() or "creating" in txt.lower() or "processing" in txt.lower()):
-                                 logger.info(f"✅ Generation confirmed via button text: '{txt}'")
-                                 return True
+                            await btn_current.wait_for_element_state("enabled", timeout=3000)
                         except:
-                            pass
+                            logger.warning("Button disabled and could not enable. May already be processing.")
+                            return True
+                except Exception as e:
+                    logger.debug(f"Disabled check failed: {e}")
 
-                        # 3. ONLY now, if we are NOT generating, check prompt
-                        logger.warning(f"Generate button disabled in retry {attempt+1}. Checking if prompt is empty...")
-                        
-                        should_refill = False
-                        if prompt:
-                            # Check prompt input
-                            p_found = await self.find_first_visible(SoraSelectors.PROMPT_INPUT)
-                            if p_found:
-                                 _, p_input = p_found
-                                 val = await p_input.input_value()
-                                 # If prompt is suspiciously short or empty...
-                                 if not val or len(val) < 5:
-                                     # CRITICAL CHANGE: Empty prompt + Disabled button usually means the system cleared it because it IS generating!
-                                     # Refilling causing the "Double Generation" (write -> click -> write -> click).
-                                     logger.info("✅ Generation confirmed: Prompt was cleared and button is disabled. Assuming success.")
-                                     return True
-                                 else:
-                                     # Prompt still there? Then it's just disabled. Failed?
-                                     logger.warning(f"Prompt is present ({len(val)} chars). Button disabled. NOT refilling to be safe.")
-                        
-                        # Wait for enable
-                        try:
-                            await btn_current.wait_for_element_state("enabled", timeout=5000)
-                        except:
-                            logger.warning("Button still disabled after wait.")
+                # Click button
+                await btn_current.click(timeout=3000)
+                logger.info("Clicked Generate button.")
 
-                    await btn_current.click(timeout=3000)
-                    logger.info("Clicked Generate.")
+                # Wait for UI to update
+                await asyncio.sleep(5)
+                await self._snapshot("debug_after_click")
 
-                    # CRITICAL SAFETY: Post-click Wait (Increased to 10s to ensure UI updates)
-                    # We MUST wait long enough for "Generating..." to appear or button to disable.
-                    await asyncio.sleep(10)
-                    await self._snapshot(f"debug_after_click_{attempt+1}")
-                    
-                    # 1. Check if ANY generation indicator appeared during wait
-                    if await self.check_is_generating():
-                         logger.info("✅ Generation confirmed (indicator appearing after click).")
-                         return True
+                # Check for success indicators
+                if await self.check_is_generating():
+                     logger.info("✅ Generation confirmed (indicator visible after click).")
+                     return True
 
-                    # 2. Check Immediate error
-                    error_el = await self.page.query_selector("div[class*='error'], [role='alert'], .text-red-500")
-                    if error_el and await error_el.is_visible():
-                        text = await error_el.text_content()
-                        if text and text.strip(): 
-                            logger.warning(f"Error after generate: {text}")
-                            await self._snapshot(f"debug_error_msg_{attempt+1}")
-                            if "quota" in text.lower() or "limit" in text.lower():
-                                raise QuotaExhaustedException(f"Quota exhausted: {text}")
-                            # If it's a transient error, we might retry. If unknown, we fail.
-                            if "unable" in text.lower() or "failed" in text.lower():
-                                 pass # Retry allowed
-                            else:
-                                 raise Exception(f"Submission error: {text}")
+                # Check for errors
+                error_el = await self.page.query_selector("div[class*='error'], [role='alert'], .text-red-500")
+                if error_el and await error_el.is_visible():
+                    text = await error_el.text_content()
+                    if text and text.strip():
+                        logger.warning(f"Error after generate: {text}")
+                        if "quota" in text.lower() or "limit" in text.lower():
+                            raise QuotaExhaustedException(f"Quota exhausted: {text}")
+                        raise Exception(f"Submission error: {text}")
 
-                    # 3. Verify Button State
-                    # If we clicked, and 10s later it's STILL enabled and NO error and NO generating text...
-                    # It's suspicious. But retrying blindly causes double-generation.
-                    
-                    try:
-                        is_disabled = await btn_current.is_disabled()
-                        is_visible = await btn_current.is_visible()
-                    except:
-                        is_disabled = False # Assuming detached = processed? No, safest is to Assume Success if element gone
-                        is_visible = False
+                # Check for verification requirements
+                from ..exceptions import VerificationRequiredException
+                for indicator in SoraSelectors.VERIFICATION_INDICATORS:
+                    if await self.page.is_visible(indicator):
+                         logger.warning(f"Verification required after submit: {indicator}")
+                         await self._snapshot("verification_after_submit")
+                         raise VerificationRequiredException(f"Verification required: {indicator}")
 
-                    if not is_visible:
-                         logger.info("✅ Click success: Generate button disappeared/detached.")
-                         return True
-                         
-                    if is_disabled:
-                         logger.info("✅ Click success: Generate button became disabled.")
-                         return True
+                # Check button state change
+                try:
+                    is_disabled = await btn_current.is_disabled()
+                    is_visible = await btn_current.is_visible()
 
-                    # If here, button is Visible AND Enabled after 10s.
-                    logger.warning(f"⚠️ Generate button still enabled after 10s. Text: {await btn_current.text_content()}")
-                    
-                    # Prevent aggressive retry if we've already done 1 retry
-                    if attempt >= 1:
-                        logger.warning("🛑 Stopping retries to prevent double-generation. Assuming potential silent success.")
-                        return True
-                    
-                    logger.warning(f"Retry click attempt {attempt + 1} failed (Button active). Retrying ONE more time...")
-                    
-                    if not is_visible:
-                         logger.info("✅ Click success: Generate button disappeared.")
-                         return True
-                         
-                    if is_disabled:
-                         logger.info("✅ Click success: Generate button became disabled.")
+                    if not is_visible or is_disabled:
+                         logger.info("✅ Click success: Button state changed (hidden or disabled).")
                          return True
 
                     btn_text = await btn_current.text_content()
                     if btn_text and ("generat" in btn_text.lower() or "creating" in btn_text.lower()):
-                         logger.info("✅ Click success: Button text changed.")
+                         logger.info("✅ Click success: Button text indicates generating.")
                          return True
+                except:
+                    # Button detached/gone likely means success
+                    logger.info("✅ Click success: Button element detached.")
+                    return True
 
-                    logger.warning(f"Generate button still enabled and visible attempt {attempt+1}. Click might have failed.")
-                    
-                except QuotaExhaustedException:
-                    raise
-                except Exception as e:
-                    logger.warning(f"Click attempt {attempt + 1} failed: {e}")
-                
-                await asyncio.sleep(1)
-                
-            await self._snapshot("debug_final_failure")
-            raise Exception("Failed to submit video request after multiple attempts (Enter + Clicks)")
+                # If we reach here, click might have failed but avoid retry
+                logger.warning("⚠️ Click did not produce clear success indicators. Assuming success to prevent double-generation.")
+                return True
+
+            except QuotaExhaustedException:
+                raise
+            except Exception as e:
+                logger.error(f"Click method failed: {e}")
+                await self._snapshot("debug_click_failure")
+                raise Exception(f"Failed to submit video request: {e}")
             
         else:
             await self._snapshot("debug_no_gen_btn")

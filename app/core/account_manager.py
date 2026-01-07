@@ -5,11 +5,20 @@ import random
 from typing import Optional, Set
 from datetime import datetime, timedelta
 import logging
+import asyncio
 
 logger = logging.getLogger(__name__)
 
 # Track accounts currently being used by workers (in-memory)
 _busy_accounts: Set[int] = set()
+_busy_accounts_lock: Optional[asyncio.Lock] = None
+
+def _get_lock():
+    """Lazy-init lock to avoid event loop issues"""
+    global _busy_accounts_lock
+    if _busy_accounts_lock is None:
+        _busy_accounts_lock = asyncio.Lock()
+    return _busy_accounts_lock
 
 
 def get_available_account(db: Session, platform: str, exclude_ids: list[int] = None) -> Optional[models.Account]:
@@ -41,16 +50,18 @@ def get_available_account(db: Session, platform: str, exclude_ids: list[int] = N
     return accounts_sorted[0]
 
 
-def mark_account_busy(account_id: int):
-    """Mark an account as currently in use"""
-    _busy_accounts.add(account_id)
-    logger.debug(f"Account #{account_id} marked as busy. Busy accounts: {_busy_accounts}")
+async def mark_account_busy(account_id: int):
+    """Mark an account as currently in use (thread-safe)"""
+    async with _get_lock():
+        _busy_accounts.add(account_id)
+        logger.debug(f"Account #{account_id} marked as busy. Busy accounts: {_busy_accounts}")
 
 
-def mark_account_free(account_id: int):
-    """Mark an account as no longer in use"""
-    _busy_accounts.discard(account_id)
-    logger.debug(f"Account #{account_id} marked as free. Busy accounts: {_busy_accounts}")
+async def mark_account_free(account_id: int):
+    """Mark an account as no longer in use (thread-safe)"""
+    async with _get_lock():
+        _busy_accounts.discard(account_id)
+        logger.debug(f"Account #{account_id} marked as free. Busy accounts: {_busy_accounts}")
 
 
 def mark_account_quota_exhausted(db: Session, account: models.Account):
