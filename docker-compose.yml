@@ -1,0 +1,18 @@
+services:
+  uni-video:
+    build: .
+    container_name: uni-video
+    restart: always
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app:/app/app:rw             # Hot-reload for code
+      - ./docs:/app/docs:rw           # Scripts
+      - ./data:/app/data:rw           # Persistent Data
+      - ./logs:/app/logs:rw           # Logs/Screenshots
+      - ./emails.txt:/app/emails.txt:rw 
+      - ./valid_accounts.txt:/app/valid_accounts.txt:rw
+      - ./credits.txt:/app/credits.txt:rw
+    environment:
+      - CHROME_HEADLESS=true          # Hint for automation scripts if needed
+    shm_size: '2gb'                   # Prevent Chrome crash

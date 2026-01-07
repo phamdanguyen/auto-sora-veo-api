@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:latenode.com)",
+      "WebFetch(domain:www.zenrows.com)",
+      "WebFetch(domain:kameleo.io)",
+      "Bash(sqlite3:*)",
+      "Bash(python3:*)",
+      "Bash(timeout 5 python3:*)",
+      "Bash(lsof:*)",
+      "Bash(xargs kill -9:*)",
+      "Bash(cat:*)",
+      "Bash(curl:*)"
+    ]
+  }
+}

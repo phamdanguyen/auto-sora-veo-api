@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+pydantic
+playwright
+jinja2
+python-multipart
+requests
+aiofiles
+cryptography
+selenium
+undetected-chromedriver
+setuptools
