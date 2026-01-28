@@ -12,3 +12,4 @@ selenium
 undetected-chromedriver
 setuptools
 curl_cffi
+aiohttp
